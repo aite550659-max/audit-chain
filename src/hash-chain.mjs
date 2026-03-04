@@ -1,4 +1,4 @@
-import { promises as fs } from 'node:fs';
+import { promises as fs, constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { sha256 } from '@noble/hashes/sha2.js';
@@ -8,6 +8,13 @@ import { sign, verify as verifySignature, getPublicKey } from './signing.mjs';
 const TEMP_SUFFIX = '.tmp';
 const HASH_PREFIX = 'sha256:';
 const SIGNATURE_PREFIX = 'secp256k1:';
+const SECURE_FILE_MODE = 0o600;
+const SECURE_DIR_MODE = 0o700;
+const APPEND_FLAGS =
+  fsConstants.O_APPEND |
+  fsConstants.O_CREAT |
+  fsConstants.O_WRONLY |
+  (typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0);
 
 const DEFAULT_STATE = {
   latestSeq: 0,
@@ -34,8 +41,18 @@ function hashEntry(entry) {
   return hashData(Buffer.from(JSON.stringify(entry)));
 }
 
-function ensureDir(dirPath) {
-  return fs.mkdir(dirPath, { recursive: true });
+async function ensureDir(dirPath) {
+  await fs.mkdir(dirPath, { recursive: true, mode: SECURE_DIR_MODE });
+  try {
+    const stats = await fs.stat(dirPath);
+    if ((stats.mode & 0o077) !== 0) {
+      await fs.chmod(dirPath, stats.mode & ~0o077);
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
+  }
 }
 
 function parseJsonLines(contents) {
@@ -104,6 +121,7 @@ export class HashChain {
     try {
       const data = await fs.readFile(this.noncePath);
       this.nonce = new Uint8Array(data);
+      await this.#hardenSecretFile(this.noncePath);
       return;
     } catch (error) {
       if (error.code !== 'ENOENT') {
@@ -128,7 +146,21 @@ export class HashChain {
     }
 
     this.nonce = new Uint8Array(nonceBytes);
-    await fs.writeFile(this.noncePath, Buffer.from(this.nonce));
+    await fs.writeFile(this.noncePath, Buffer.from(this.nonce), { mode: SECURE_FILE_MODE });
+    await this.#hardenSecretFile(this.noncePath);
+  }
+
+  async #hardenSecretFile(filePath) {
+    try {
+      const stats = await fs.stat(filePath);
+      if ((stats.mode & 0o077) !== 0) {
+        await fs.chmod(filePath, SECURE_FILE_MODE);
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        throw error;
+      }
+    }
   }
 
   async #loadState() {
@@ -206,22 +238,34 @@ export class HashChain {
 
   async #writeFileAtomic(filePath, contents) {
     const tmpPath = `${filePath}${TEMP_SUFFIX}`;
-    await fs.writeFile(tmpPath, contents);
+    await fs.writeFile(tmpPath, contents, { mode: SECURE_FILE_MODE });
     await fs.rename(tmpPath, filePath);
   }
 
   async #appendJsonLine(filePath, line) {
-    let existing = '';
+    const payload = `${line}\n`;
+    let handle;
     try {
-      existing = await fs.readFile(filePath, 'utf8');
+      handle = await fs.open(filePath, APPEND_FLAGS, SECURE_FILE_MODE);
     } catch (error) {
-      if (error.code !== 'ENOENT') {
+      if (error.code === 'ELOOP') {
+        throw new Error(`Refusing to append via symlink: ${filePath}`);
+      }
+      if (error.code === 'ENOTSUP' || error.code === 'EINVAL') {
+        const fallbackFlags = fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_WRONLY;
+        handle = await fs.open(filePath, fallbackFlags, SECURE_FILE_MODE);
+      } else {
         throw error;
       }
     }
 
-    const next = existing ? `${existing}${line}\n` : `${line}\n`;
-    await this.#writeFileAtomic(filePath, next);
+    try {
+      await handle.write(payload);
+    } finally {
+      if (handle) {
+        await handle.close();
+      }
+    }
   }
 
   async #readEntries(filePath) {
